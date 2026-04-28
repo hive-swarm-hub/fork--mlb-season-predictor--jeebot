@@ -67,10 +67,6 @@ def _prompt_payload(team_state: dict) -> dict:
     prompt construction and tracing on this allowlist so diagnostics cannot
     accidentally become a frozen-label leak.
     """
-    roster = team_state.get("roster", [])
-    hitters = [_summarize_player(p) for p in _top_players(roster, None, 10) if p.get("role") in {"position_player", "bench", "callup"}]
-    starters = [_summarize_player(p) for p in _top_players(roster, "starter", 7)]
-    relievers = [_summarize_player(p) for p in _top_players(roster, "reliever", 5)]
     team_keys = selected_team_keys()
     team_summary = {key: team_state.get(key) for key in team_keys if key in team_state}
     peers = peer_summary(
@@ -82,9 +78,6 @@ def _prompt_payload(team_state: dict) -> dict:
         "task": "Project MLB final standings outcomes from this checkpoint. Use league_peers to calibrate where this team ranks within its league.",
         "team_state": team_summary,
         "league_peers": peers,
-        "top_hitters": hitters,
-        "starting_pitchers": starters,
-        "high_leverage_relievers": relievers,
         "output_schema": {
             "projected_wins": "number",
             "playoff_prob": "0..1",
