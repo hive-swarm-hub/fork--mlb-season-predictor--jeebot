@@ -22,6 +22,7 @@ from helper.league_context import peer_summary
 ROOT = Path(__file__).resolve().parent
 CACHE_DIR = ROOT / ".cache" / "grok_predictions"
 DEFAULT_MODEL = "grok-4-1-fast-reasoning"
+DEFAULT_TEMPERATURE = 0.0
 
 
 def _harness_fingerprint() -> str:
@@ -40,10 +41,11 @@ def _harness_fingerprint() -> str:
     return hashlib.sha256(blob.encode()).hexdigest()[:20]
 
 
-def _cache_key(team_state: dict, model: str) -> str:
+def _cache_key(team_state: dict, model: str, temperature: float = DEFAULT_TEMPERATURE) -> str:
     payload = {
         "harness": _harness_fingerprint(),
         "model": model,
+        "temperature": temperature,
         "prompt_payload": _prompt_payload(team_state),
     }
     blob = json.dumps(payload, sort_keys=True, separators=(",", ":"))
@@ -169,7 +171,8 @@ def _call_grok(team_state: dict, trace: dict | None = None) -> dict:
         raise RuntimeError("openai package is required to call the Grok-compatible API") from exc
 
     model = os.getenv("XAI_MODEL", DEFAULT_MODEL)
-    key = _cache_key(team_state, model)
+    temperature = float(os.getenv("XAI_TEMPERATURE", str(DEFAULT_TEMPERATURE)))
+    key = _cache_key(team_state, model, temperature)
     cache_path = CACHE_DIR / f"{key}.json"
     if trace is not None:
         trace["model"] = model
@@ -191,7 +194,7 @@ def _call_grok(team_state: dict, trace: dict | None = None) -> dict:
     try:
         response = client.chat.completions.create(
             model=model,
-            temperature=0.2,
+            temperature=temperature,
             messages=[
                 {
                     "role": "system",
