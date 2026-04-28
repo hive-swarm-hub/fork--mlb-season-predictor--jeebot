@@ -75,7 +75,15 @@ def _prompt_payload(team_state: dict) -> dict:
         league=team_state.get("league"),
     )
     return {
-        "task": "Project MLB final standings outcomes from this checkpoint. Use league_peers to calibrate where this team ranks within its league.",
+        "task": (
+            "Project MLB final standings outcomes from this checkpoint. "
+            "Reasoning chain: (1) order league_peers from strongest to weakest using projection_blend_war + pythag_win_pct "
+            "+ sp_war + bullpen WAR + checkpoint_wins_above_pace, breaking ties with schedule_strength and durability signals. "
+            "(2) place this team in that ranking. "
+            "(3) set projected_wins consistent with the implied league rank — top-of-league teams usually project mid-90s, "
+            "middle teams low-80s, bottom teams low-70s, but use the projection-system spread to widen or tighten when signal is strong. "
+            "Probabilities should follow the same rank: top-3 league teams have higher division/playoff/league/WS odds than middle teams."
+        ),
         "team_state": team_summary,
         "league_peers": peers,
         "output_schema": {
