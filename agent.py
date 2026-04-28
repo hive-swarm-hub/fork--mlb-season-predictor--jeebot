@@ -151,67 +151,85 @@ def _normalize_prediction(raw: dict) -> dict:
     }
 
 
-def _call_grok(team_state: dict, trace: dict | None = None) -> dict:
+def _sample_cache_key(team_state: dict, model: str, sample_idx: int) -> str:
+    payload = {
+        "harness": _harness_fingerprint(),
+        "model": model,
+        "sample_idx": sample_idx,
+        "prompt_payload": _prompt_payload(team_state),
+    }
+    blob = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(blob.encode()).hexdigest()
+
+
+def _single_grok_sample(team_state: dict, sample_idx: int = 0) -> dict:
     api_key = os.getenv("XAI_API_KEY")
     if not api_key:
         raise RuntimeError("XAI_API_KEY is required; this task has no local fallback")
-
     try:
         from openai import OpenAI
     except Exception as exc:
         raise RuntimeError("openai package is required to call the Grok-compatible API") from exc
-
     model = os.getenv("XAI_MODEL", DEFAULT_MODEL)
-    key = _cache_key(team_state, model)
+    if sample_idx == 0:
+        key = _cache_key(team_state, model)
+    else:
+        key = _sample_cache_key(team_state, model, sample_idx)
     cache_path = CACHE_DIR / f"{key}.json"
-    if trace is not None:
-        trace["model"] = model
-        trace["cache_key"] = key
-        trace["prompt_payload"] = _prompt_payload(team_state)
     if cache_path.exists():
-        cached = json.loads(cache_path.read_text())
-        prediction = _normalize_prediction(cached)
-        if trace is not None:
-            trace["source"] = "grok_cache"
-            trace["model_prediction"] = prediction
-        return prediction
-
-    client = OpenAI(
-        api_key=api_key,
-        base_url=os.getenv("XAI_BASE_URL", "https://api.x.ai/v1"),
+        return _normalize_prediction(json.loads(cache_path.read_text()))
+    client = OpenAI(api_key=api_key, base_url=os.getenv("XAI_BASE_URL", "https://api.x.ai/v1"))
+    response = client.chat.completions.create(
+        model=model,
+        temperature=0.2,
+        messages=[
+            {
+                "role": "system",
+                "content": (
+                    "You are an MLB season forecasting model. "
+                    "Use only the supplied team and roster state. Return strict JSON."
+                ),
+            },
+            {"role": "user", "content": _prompt(team_state)},
+        ],
     )
-    started = time.time()
-    try:
-        response = client.chat.completions.create(
-            model=model,
-            temperature=0.2,
-            messages=[
-                {
-                    "role": "system",
-                    "content": (
-                        "You are an MLB season forecasting model. "
-                        "Use only the supplied team and roster state. Return strict JSON."
-                    ),
-                },
-                {"role": "user", "content": _prompt(team_state)},
-            ],
-        )
-    except Exception as exc:
-        raise RuntimeError(f"Grok API request failed: {type(exc).__name__}: {exc}") from exc
     content = response.choices[0].message.content or "{}"
-    elapsed_ms = round((time.time() - started) * 1000)
     raw = _extract_json(content)
     prediction = _normalize_prediction(raw)
-    if trace is not None:
-        trace["source"] = "grok_api"
-        trace["elapsed_ms"] = elapsed_ms
-        trace["raw_response_sha256"] = hashlib.sha256(content.encode()).hexdigest()
-        if _trace_raw_enabled():
-            trace["raw_model_text"] = content
-        trace["parsed_model_json"] = raw
-        trace["model_prediction"] = prediction
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
     cache_path.write_text(json.dumps(prediction, sort_keys=True) + "\n")
+    return prediction
+
+
+def _aggregate_predictions(samples: list[dict]) -> dict:
+    """Mean of projected_wins, median of probabilities, median of interval bounds."""
+    import statistics
+    wins = statistics.fmean([s["projected_wins"] for s in samples])
+    lows = statistics.median([s["win_interval_80"][0] for s in samples])
+    highs = statistics.median([s["win_interval_80"][1] for s in samples])
+    return _normalize_prediction({
+        "projected_wins": wins,
+        "playoff_prob": statistics.median([s["playoff_prob"] for s in samples]),
+        "division_winner_prob": statistics.median([s["division_winner_prob"] for s in samples]),
+        "league_champion_prob": statistics.median([s["league_champion_prob"] for s in samples]),
+        "world_series_champion_prob": statistics.median([s["world_series_champion_prob"] for s in samples]),
+        "win_interval_80": [lows, highs],
+    })
+
+
+def _call_grok(team_state: dict, trace: dict | None = None) -> dict:
+    n_samples = max(1, int(os.getenv("MLB_N_SAMPLES", "3")))
+    model = os.getenv("XAI_MODEL", DEFAULT_MODEL)
+    if trace is not None:
+        trace["model"] = model
+        trace["n_samples"] = n_samples
+        trace["prompt_payload"] = _prompt_payload(team_state)
+    samples = [_single_grok_sample(team_state, i) for i in range(n_samples)]
+    prediction = _aggregate_predictions(samples) if len(samples) > 1 else samples[0]
+    if trace is not None:
+        trace["source"] = "grok_self_consistency" if n_samples > 1 else "grok_api"
+        trace["model_prediction"] = prediction
+        trace["sample_predictions"] = samples
     return prediction
 
 def predict(team_state: dict) -> dict:
