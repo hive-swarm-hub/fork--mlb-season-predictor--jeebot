@@ -79,7 +79,15 @@ def _prompt_payload(team_state: dict) -> dict:
         league=team_state.get("league"),
     )
     return {
-        "task": "Project MLB final standings outcomes from this checkpoint. Use league_peers to calibrate where this team ranks within its league.",
+        "task": (
+            "Project MLB final standings outcomes from this checkpoint. "
+            "league_peers lists every team in this team's league (15 teams) sorted by projection_blend_war desc, "
+            "label-safe (no win totals or final ranks). "
+            "Identify where this team ranks within its league based on roster strength, run-quality estimators, "
+            "defense, durability, and schedule difficulty relative to peers, then set projected_wins consistent "
+            "with that within-league rank. MLB teams almost always finish between 50 and 105 wins; only set "
+            "projected_wins outside [55, 100] if the underlying signal is extreme."
+        ),
         "team_state": team_summary,
         "league_peers": peers,
         "top_hitters": hitters,
