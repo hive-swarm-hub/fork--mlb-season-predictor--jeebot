@@ -17,3 +17,4 @@ outputs/
 dist/
 eval/.identity_map.json
 .claude/
+.hive/
