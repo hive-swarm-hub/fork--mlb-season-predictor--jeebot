@@ -16,6 +16,7 @@ from pathlib import Path
 
 from helper.features import clamp
 from helper.harness_policy import get_harness_policy, selected_player_keys, selected_team_keys
+from helper.league_context import peer_summary
 
 
 ROOT = Path(__file__).resolve().parent
@@ -72,9 +73,15 @@ def _prompt_payload(team_state: dict) -> dict:
     relievers = [_summarize_player(p) for p in _top_players(roster, "reliever", 5)]
     team_keys = selected_team_keys()
     team_summary = {key: team_state.get(key) for key in team_keys if key in team_state}
+    peers = peer_summary(
+        season=team_state.get("season"),
+        checkpoint=team_state.get("checkpoint"),
+        league=team_state.get("league"),
+    )
     return {
-        "task": "Project MLB final standings outcomes from this checkpoint.",
+        "task": "Project MLB final standings outcomes from this checkpoint. Use league_peers to calibrate where this team ranks within its league.",
         "team_state": team_summary,
+        "league_peers": peers,
         "top_hitters": hitters,
         "starting_pitchers": starters,
         "high_leverage_relievers": relievers,
