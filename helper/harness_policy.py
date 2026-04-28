@@ -55,9 +55,6 @@ PLAYER_BASE_KEYS: tuple[str, ...] = (
 TEAM_FEATURE_GROUPS: dict[str, list[str]] = {
     "projection_war": [
         "projection_blend_war",
-        "dc_team_war",
-        "steamer_team_war",
-        "zips_team_war",
         "pos_war",
         "sp_war",
         "rp_war",
