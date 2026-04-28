@@ -134,12 +134,12 @@ DEFAULT_SELECTED_TEAM_GROUPS: tuple[str, ...] = (
     "run_quality",
     "schedule_park",
     "checkpoint_form",
+    "defense",
+    "durability",
 )
 
 DEFAULT_SELECTED_PLAYER_GROUPS: tuple[str, ...] = (
     "war_usage",
-    "hitting_run",
-    "pitching_stuff",
     "durability_risk",
 )
 
