@@ -36,6 +36,13 @@ PEER_KEYS: tuple[str, ...] = (
     "schedule_strength",
 )
 
+CROSS_LEAGUE_PEER_KEYS: tuple[str, ...] = (
+    "team_id",
+    "league",
+    "projection_blend_war",
+    "pythag_win_pct",
+)
+
 
 def _label_safe(row: dict) -> dict:
     return {k: v for k, v in row.items() if k not in FORBIDDEN_TARGET_KEYS}
@@ -65,3 +72,19 @@ def peer_summary(season: int, checkpoint: str, league: str) -> list[dict]:
     """
     rows = _peer_index().get((int(season), str(checkpoint), str(league)), [])
     return [{k: r.get(k) for k in PEER_KEYS if k in r} for r in rows]
+
+
+def cross_league_summary(season: int, checkpoint: str, exclude_league: str) -> list[dict]:
+    """Compact MLB-wide rank context: every team NOT in exclude_league at this checkpoint.
+
+    Sorted by projection_blend_war desc. Limited to four fields per peer to stay
+    well under the prompt-attention budget.
+    """
+    index = _peer_index()
+    out: list[dict] = []
+    for (s, cp, lg), rows in index.items():
+        if s != int(season) or cp != str(checkpoint) or lg == str(exclude_league):
+            continue
+        out.extend(rows)
+    out.sort(key=lambda r: float(r.get("projection_blend_war", 0.0)), reverse=True)
+    return [{k: r.get(k) for k in CROSS_LEAGUE_PEER_KEYS if k in r} for r in out]
