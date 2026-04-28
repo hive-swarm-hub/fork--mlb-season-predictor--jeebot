@@ -26,14 +26,7 @@ CONTEXT_CSVS: tuple[Path, ...] = (
 PEER_KEYS: tuple[str, ...] = (
     "team_id",
     "projection_blend_war",
-    "pos_war",
-    "sp_war",
-    "rp_war",
     "pythag_win_pct",
-    "third_order_win_pct",
-    "prev_win_pct",
-    "checkpoint_wins_above_pace",
-    "schedule_strength",
 )
 
 
