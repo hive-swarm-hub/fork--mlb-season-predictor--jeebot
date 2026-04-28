@@ -14,14 +14,26 @@ import re
 import time
 from pathlib import Path
 
-from helper.features import clamp
-from helper.harness_policy import get_harness_policy, selected_player_keys, selected_team_keys
+from helper.features import clamp, load_rosters, load_rows, roster_key
+from helper.harness_policy import FORBIDDEN_TARGET_KEYS, get_harness_policy, selected_player_keys, selected_team_keys
 from helper.league_context import peer_summary
 
 
 ROOT = Path(__file__).resolve().parent
 CACHE_DIR = ROOT / ".cache" / "grok_predictions"
+BATCH_CACHE_DIR = ROOT / ".cache" / "grok_batch"
 DEFAULT_MODEL = "grok-4-1-fast-reasoning"
+DEFAULT_TEMPERATURE = 0.2
+
+# Disk locations for full team-state / roster lookup in batch mode.
+_BATCH_CSV_CANDIDATES: tuple[tuple[Path, Path], ...] = (
+    (ROOT / "eval" / "test_data" / "frozen_test.csv", ROOT / "eval" / "test_data" / "frozen_test_players.csv"),
+    (ROOT / "data" / "val" / "team_states.csv", ROOT / "data" / "val" / "player_states.csv"),
+    (ROOT / "data" / "train" / "team_states.csv", ROOT / "data" / "train" / "player_states.csv"),
+)
+import threading
+_BATCH_LOCKS: dict[tuple[int, str, str], threading.Lock] = {}
+_BATCH_LOCKS_GUARD = threading.Lock()
 
 
 def _harness_fingerprint() -> str:
@@ -221,6 +233,169 @@ def _call_grok(team_state: dict, trace: dict | None = None) -> dict:
     cache_path.write_text(json.dumps(prediction, sort_keys=True) + "\n")
     return prediction
 
+def _team_state_for_batch(row: dict, rosters: dict) -> dict:
+    """Strip target labels and attach roster — label-safe view of a team-season."""
+    safe = {k: v for k, v in row.items() if k not in FORBIDDEN_TARGET_KEYS}
+    safe["roster"] = rosters.get(roster_key(row), [])
+    return safe
+
+
+def _league_team_states(season: int, checkpoint: str, league: str) -> list[dict]:
+    """Load full label-safe team_states (with rosters) for every team in a league/checkpoint."""
+    for team_csv, player_csv in _BATCH_CSV_CANDIDATES:
+        if not team_csv.exists():
+            continue
+        rows = [
+            r
+            for r in load_rows(team_csv)
+            if int(r["season"]) == int(season)
+            and str(r["checkpoint"]) == str(checkpoint)
+            and str(r["league"]) == str(league)
+        ]
+        if not rows:
+            continue
+        rosters = load_rosters(player_csv) if player_csv.exists() else {}
+        return [_team_state_for_batch(r, rosters) for r in rows]
+    return []
+
+
+def _team_block(state: dict) -> dict:
+    """Per-team payload block used inside the batch prompt."""
+    roster = state.get("roster", [])
+    hitters = [_summarize_player(p) for p in _top_players(roster, None, 10) if p.get("role") in {"position_player", "bench", "callup"}]
+    starters = [_summarize_player(p) for p in _top_players(roster, "starter", 7)]
+    relievers = [_summarize_player(p) for p in _top_players(roster, "reliever", 5)]
+    team_keys = selected_team_keys()
+    team_summary = {key: state.get(key) for key in team_keys if key in state}
+    return {
+        "team_id": state.get("team_id"),
+        "division": state.get("division"),
+        "team_state": team_summary,
+        "top_hitters": hitters,
+        "starting_pitchers": starters,
+        "high_leverage_relievers": relievers,
+    }
+
+
+def _batch_payload(states: list[dict]) -> dict:
+    return {
+        "task": (
+            "Project MLB final standings outcomes for ALL teams listed in this league at this checkpoint. "
+            "Order the teams by expected wins so the rankings within and across divisions are internally consistent. "
+            "Return a JSON object whose top-level keys are team_ids and whose values match output_schema. "
+            "Cover every team in `teams`."
+        ),
+        "season": states[0].get("season") if states else None,
+        "checkpoint": states[0].get("checkpoint") if states else None,
+        "league": states[0].get("league") if states else None,
+        "teams": [_team_block(s) for s in states],
+        "output_schema": {
+            "<team_id>": {
+                "projected_wins": "number",
+                "playoff_prob": "0..1",
+                "division_winner_prob": "0..1",
+                "league_champion_prob": "0..1",
+                "world_series_champion_prob": "0..1",
+                "win_interval_80": ["low", "high"],
+            }
+        },
+    }
+
+
+def _batch_cache_path(season: int, checkpoint: str, league: str, model: str, temperature: float) -> Path:
+    payload = {
+        "harness": _harness_fingerprint(),
+        "model": model,
+        "temperature": temperature,
+        "season": int(season),
+        "checkpoint": str(checkpoint),
+        "league": str(league),
+    }
+    blob = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    return BATCH_CACHE_DIR / f"{hashlib.sha256(blob.encode()).hexdigest()}.json"
+
+
+def _batch_lock(key: tuple[int, str, str]) -> threading.Lock:
+    with _BATCH_LOCKS_GUARD:
+        lock = _BATCH_LOCKS.get(key)
+        if lock is None:
+            lock = threading.Lock()
+            _BATCH_LOCKS[key] = lock
+        return lock
+
+
+def _ensure_batch_predictions(season: int, checkpoint: str, league: str) -> dict[str, dict]:
+    """Return {team_id: prediction} for every team in (season, checkpoint, league).
+
+    Uses a single Grok call per league/checkpoint and caches on disk so the
+    eval can replay results across runs without re-spending tokens.
+    """
+    api_key = os.getenv("XAI_API_KEY")
+    if not api_key:
+        raise RuntimeError("XAI_API_KEY is required; this task has no local fallback")
+    model = os.getenv("XAI_MODEL", DEFAULT_MODEL)
+    temperature = float(os.getenv("XAI_TEMPERATURE", str(DEFAULT_TEMPERATURE)))
+    cache_path = _batch_cache_path(season, checkpoint, league, model, temperature)
+    if cache_path.exists():
+        return json.loads(cache_path.read_text())
+    lock = _batch_lock((int(season), str(checkpoint), str(league)))
+    with lock:
+        if cache_path.exists():
+            return json.loads(cache_path.read_text())
+        states = _league_team_states(season, checkpoint, league)
+        if not states:
+            raise RuntimeError(f"no team-states found for batch ({season}, {checkpoint}, {league})")
+        try:
+            from openai import OpenAI
+        except Exception as exc:
+            raise RuntimeError("openai package is required to call the Grok-compatible API") from exc
+        client = OpenAI(api_key=api_key, base_url=os.getenv("XAI_BASE_URL", "https://api.x.ai/v1"))
+        payload = _batch_payload(states)
+        prompt_text = (
+            "Return only compact JSON. Top-level keys are the team_ids listed in `teams`; values follow output_schema. "
+            "Do not include markdown.\n"
+            + json.dumps(payload, sort_keys=True)
+        )
+        response = client.chat.completions.create(
+            model=model,
+            temperature=temperature,
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "You are an MLB season forecasting model. "
+                        "Use only the supplied team and roster state. Return strict JSON."
+                    ),
+                },
+                {"role": "user", "content": prompt_text},
+            ],
+        )
+        content = response.choices[0].message.content or "{}"
+        raw = _extract_json(content)
+        normalized: dict[str, dict] = {}
+        for team_id, pred in raw.items():
+            if not isinstance(pred, dict):
+                continue
+            try:
+                normalized[str(team_id)] = _normalize_prediction(pred)
+            except Exception:
+                continue
+        BATCH_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        cache_path.write_text(json.dumps(normalized, sort_keys=True) + "\n")
+        return normalized
+
+
+def _batch_predict(team_state: dict) -> dict | None:
+    season = team_state.get("season")
+    checkpoint = team_state.get("checkpoint")
+    league = team_state.get("league")
+    team_id = team_state.get("team_id")
+    if season is None or checkpoint is None or league is None or team_id is None:
+        return None
+    batch = _ensure_batch_predictions(int(season), str(checkpoint), str(league))
+    return batch.get(str(team_id))
+
+
 def predict(team_state: dict) -> dict:
     trace: dict | None = None
     if _trace_path() is not None:
@@ -243,14 +418,28 @@ def predict(team_state: dict) -> dict:
             },
         }
 
-    try:
-        prediction = _call_grok(team_state, trace)
-    except Exception as exc:
-        if trace is not None:
-            trace["source"] = "grok_error"
-            trace["error"] = f"{type(exc).__name__}: {exc}"
-            _write_trace(trace)
-        raise
+    use_batch = os.getenv("MLB_BATCH_MODE", "1").lower() not in {"0", "false", "no"}
+    prediction: dict | None = None
+    if use_batch:
+        try:
+            prediction = _batch_predict(team_state)
+            if prediction is not None and trace is not None:
+                trace["source"] = "grok_batch"
+        except Exception as exc:
+            if trace is not None:
+                trace["batch_error"] = f"{type(exc).__name__}: {exc}"
+            prediction = None
+
+    if prediction is None:
+        try:
+            prediction = _call_grok(team_state, trace)
+        except Exception as exc:
+            if trace is not None:
+                trace["source"] = "grok_error"
+                trace["error"] = f"{type(exc).__name__}: {exc}"
+                _write_trace(trace)
+            raise
+
     if trace is not None:
         trace["final_prediction"] = prediction
         _write_trace(trace)
