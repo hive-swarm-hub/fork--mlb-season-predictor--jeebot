@@ -79,7 +79,7 @@ def _prompt_payload(team_state: dict) -> dict:
         "team_state": team_summary,
         "league_peers": peers,
         "output_schema": {
-            "projected_wins": "number",
+            "projected_wins": "number to 1 decimal place; do not round to integers — small differences distinguish teams of similar strength",
             "playoff_prob": "0..1",
             "division_winner_prob": "0..1",
             "league_champion_prob": "0..1",
